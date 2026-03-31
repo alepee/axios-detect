@@ -27,7 +27,7 @@ RELATED_PKGS=("@shadanai/openclaw" "@qqbrowser/openclaw-qbot")
 PARALLEL=10
 BRANCH_MODE="default"  # "default" = default branch only, "all" = all branches
 INCLUDE_ARCHIVED=false
-INCLUDE_FORKS=false
+INCLUDE_FORKS=true
 ORG=""
 
 # --- Parse args ---
