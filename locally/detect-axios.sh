@@ -6,8 +6,12 @@
 #
 # Detects:
 #   - axios@1.14.1 and axios@0.30.4 in lockfiles and installed node_modules
-#   - plain-crypto-js dependency (the malicious package)
-#   - OS-level execution artifacts (temp dirs, C2 domain traces)
+#   - plain-crypto-js dependency (the malicious dropper package)
+#   - Related campaign packages (@shadanai/openclaw, @qqbrowser/openclaw-qbot)
+#   - RAT payload files at known paths (persist after dropper self-cleanup)
+#   - Running RAT processes and active C2 connections (domain + IP)
+#   - C2 traces in system logs, DNS cache, proxy logs (incl. fake IE8 User-Agent)
+#   - Malicious tarballs in npm cache
 
 set -euo pipefail
 
@@ -20,7 +24,18 @@ RESET='\033[0m'
 COMPROMISED_VERSION="1.14.1"
 COMPROMISED_VERSION_0X="0.30.4"
 MALICIOUS_DEP="plain-crypto-js"
+# Related campaign packages (same attacker infrastructure)
+RELATED_PKGS=("@shadanai/openclaw" "@qqbrowser/openclaw-qbot")
 C2_DOMAIN="sfrclak.com"
+C2_IP="142.11.206.73"
+C2_PORT="8000"
+# Known RAT payload paths (persist after dropper self-cleanup)
+RAT_PATHS_DARWIN=("/Library/Caches/com.apple.act.mond")
+RAT_PATHS_LINUX=("/tmp/ld.py")
+# Known dropper temp file names (self-delete, but check anyway)
+DROPPER_NAMES=("6202033.vbs" "6202033.ps1" "ld.py")
+# Fake User-Agent used by the RAT for C2 beaconing
+RAT_USER_AGENT="mozilla/4.0 (compatible; msie 8.0; windows nt 5.1; trident/4.0)"
 
 ROOT="${1:-/}"
 FOUND=0
@@ -51,10 +66,11 @@ log_info() {
 echo -e "${BOLD}=== Axios Supply Chain Scanner (local) ===${RESET}"
 echo "Scanning: ${ROOT}"
 echo "Looking for: axios@${COMPROMISED_VERSION} / axios@${COMPROMISED_VERSION_0X} / ${MALICIOUS_DEP}"
+echo "Also checking: related campaign packages, RAT payloads, C2 traces, npm cache"
 echo ""
 
 # --- 1. Scan installed node_modules/axios/package.json ---
-echo -e "${BOLD}[1/4] Scanning installed axios packages in node_modules...${RESET}"
+echo -e "${BOLD}[1/6] Scanning installed axios packages in node_modules...${RESET}"
 
 while IFS= read -r pkg_json; do
   version=$(grep -o '"version"\s*:\s*"[^"]*"' "$pkg_json" 2>/dev/null | head -1 | grep -o '[0-9][^"]*' || true)
@@ -81,7 +97,7 @@ done < <(find "$ROOT" \
   2>/dev/null || true)
 
 # --- 2. Scan lockfiles ---
-echo -e "${BOLD}[2/4] Scanning lockfiles...${RESET}"
+echo -e "${BOLD}[2/6] Scanning lockfiles...${RESET}"
 
 scan_lockfile() {
   local file="$1"
@@ -202,7 +218,7 @@ done < <(find "$ROOT" \
   2>/dev/null || true)
 
 # --- 3. Check for malicious package installation ---
-echo -e "${BOLD}[3/4] Scanning for '${MALICIOUS_DEP}' installed in node_modules...${RESET}"
+echo -e "${BOLD}[3/6] Scanning for malicious packages in node_modules...${RESET}"
 
 while IFS= read -r mal_pkg; do
   log_alert "Malicious package installed: ${mal_pkg}"
@@ -215,24 +231,72 @@ done < <(find "$ROOT" \
   -o -path "*node_modules/${MALICIOUS_DEP}/package.json" -print \
   2>/dev/null || true)
 
-# --- 4. Scan for execution artifacts ---
-echo -e "${BOLD}[4/4] Scanning for malware execution artifacts...${RESET}"
+# Also check for related campaign packages
+for related_pkg in "${RELATED_PKGS[@]}"; do
+  while IFS= read -r rel_pkg; do
+    log_alert "Related campaign package installed: ${rel_pkg}"
+    escalate_severity "INSTALLED"
+  done < <(find "$ROOT" \
+    -path "*node_modules/${related_pkg}/package.json" \
+    2>/dev/null || true)
+done
+
+# --- 4. Scan for RAT payload files (persist after dropper self-cleanup) ---
+echo -e "${BOLD}[4/6] Scanning for RAT payload files...${RESET}"
 
 ARTIFACT_FOUND=false
+OS_TYPE="$(uname)"
 
-# Directories to check for dropper artifacts
+# 4a. Check known RAT binary/script paths by platform
+if [[ "$OS_TYPE" == "Darwin" ]]; then
+  for rat_path in "${RAT_PATHS_DARWIN[@]}"; do
+    if [[ -f "$rat_path" ]]; then
+      log_alert "RAT payload found: ${rat_path}"
+      ARTIFACT_FOUND=true
+      # Verify it's not legitimately signed by Apple
+      if command -v codesign &>/dev/null; then
+        if ! codesign -v "$rat_path" 2>/dev/null; then
+          log_alert "  File is NOT signed by Apple (expected for RAT)"
+        fi
+      fi
+    fi
+  done
+elif [[ "$OS_TYPE" == "Linux" ]]; then
+  for rat_path in "${RAT_PATHS_LINUX[@]}"; do
+    if [[ -f "$rat_path" ]]; then
+      log_alert "RAT payload found: ${rat_path}"
+      ARTIFACT_FOUND=true
+    fi
+  done
+fi
+
+# 4b. Check for Windows payload paths (when running under WSL)
+if [[ "$OS_TYPE" == "Linux" ]] && [[ -d /mnt/c/ProgramData ]]; then
+  if [[ -f /mnt/c/ProgramData/wt.exe ]]; then
+    log_alert "RAT payload found: /mnt/c/ProgramData/wt.exe (Windows via WSL)"
+    ARTIFACT_FOUND=true
+  fi
+fi
+
+# 4c. Check temp directories for known dropper file names
 TEMP_DIRS=("/tmp" "/var/tmp")
 [[ -n "${TMPDIR:-}" ]] && TEMP_DIRS+=("$TMPDIR")
 
-# On macOS, also check per-user temp
-if [[ "$(uname)" == "Darwin" ]]; then
+if [[ "$OS_TYPE" == "Darwin" ]]; then
   user_tmp=$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null || true)
   [[ -n "$user_tmp" ]] && TEMP_DIRS+=("$user_tmp")
 fi
 
-# Check temp directories for recently created suspicious files (last 48h)
 for tmp_dir in "${TEMP_DIRS[@]}"; do
   [[ -d "$tmp_dir" ]] || continue
+  # Check for exact known dropper filenames
+  for dropper_name in "${DROPPER_NAMES[@]}"; do
+    while IFS= read -r dropper_file; do
+      log_alert "Dropper artifact found: ${dropper_file}"
+      ARTIFACT_FOUND=true
+    done < <(find "$tmp_dir" -maxdepth 2 -name "$dropper_name" -type f 2>/dev/null || true)
+  done
+  # Also check for the generic patterns (catch variants)
   while IFS= read -r suspicious_file; do
     log_alert "Suspicious recent file in temp directory: ${suspicious_file}"
     ARTIFACT_FOUND=true
@@ -242,27 +306,107 @@ for tmp_dir in "${TEMP_DIRS[@]}"; do
     2>/dev/null | grep -iE "crypto|axios|plain|payload|dropper" || true)
 done
 
-# Check for C2 domain in DNS cache / logs
-if command -v log &>/dev/null && [[ "$(uname)" == "Darwin" ]]; then
-  echo "  Checking macOS DNS logs (this may take a moment)..."
-  if timeout 30 log show --predicate "processImagePath contains 'mDNSResponder'" --last 48h 2>/dev/null \
-    | grep -q "${C2_DOMAIN}" 2>/dev/null; then
-    log_alert "C2 domain '${C2_DOMAIN}' found in DNS logs"
+# --- 5. Scan for network/process/log artifacts ---
+echo -e "${BOLD}[5/6] Scanning for C2 network traces and suspicious processes...${RESET}"
+
+# 5a. Check for running RAT processes
+if command -v pgrep &>/dev/null; then
+  # macOS: RAT runs from /Library/Caches/com.apple.act.mond
+  if pgrep -f "com.apple.act.mond" &>/dev/null; then
+    log_alert "Running process matches RAT: com.apple.act.mond"
     ARTIFACT_FOUND=true
   fi
-elif [[ -f /var/log/syslog ]]; then
-  if grep -q "${C2_DOMAIN}" /var/log/syslog 2>/dev/null; then
-    log_alert "C2 domain '${C2_DOMAIN}' found in syslog"
+  # Linux: python3 /tmp/ld.py orphaned to PID 1
+  if pgrep -f "/tmp/ld.py" &>/dev/null; then
+    log_alert "Running process matches RAT: python3 /tmp/ld.py"
+    ARTIFACT_FOUND=true
+  fi
+  # Windows payload name via WSL
+  if pgrep -f "wt.exe" &>/dev/null; then
+    log_warn "Process 'wt.exe' is running (may be Windows Terminal or the RAT — verify manually)"
+  fi
+fi
+
+# 5b. Check for active network connections to C2 (domain and IP)
+if command -v ss &>/dev/null; then
+  if ss -tnp 2>/dev/null | grep -qE "${C2_IP}|:${C2_PORT}" 2>/dev/null; then
+    log_alert "Active connection to C2 IP ${C2_IP} or port ${C2_PORT} detected (ss)"
+    ARTIFACT_FOUND=true
+  fi
+elif command -v lsof &>/dev/null; then
+  if lsof -i "@${C2_IP}" 2>/dev/null | grep -q . 2>/dev/null; then
+    log_alert "Active connection to C2 IP ${C2_IP} detected (lsof)"
+    ARTIFACT_FOUND=true
+  fi
+  if lsof -i ":${C2_PORT}" 2>/dev/null | grep -qE "${C2_DOMAIN}|${C2_IP}" 2>/dev/null; then
+    log_alert "Active connection to C2 server on port ${C2_PORT} detected (lsof)"
     ARTIFACT_FOUND=true
   fi
 fi
 
-# Check for active/recent network connections to C2
-if command -v lsof &>/dev/null; then
-  if lsof -i :8000 2>/dev/null | grep -q "${C2_DOMAIN}" 2>/dev/null; then
-    log_alert "Active connection to C2 server ${C2_DOMAIN}:8000 detected"
+# 5c. Check for C2 domain/IP in DNS cache and system logs
+if [[ "$OS_TYPE" == "Darwin" ]] && command -v log &>/dev/null; then
+  echo "  Checking macOS unified log for C2 traces (this may take a moment)..."
+  if timeout 30 log show --predicate "processImagePath contains 'mDNSResponder'" --last 48h 2>/dev/null \
+    | grep -qE "${C2_DOMAIN}|${C2_IP}" 2>/dev/null; then
+    log_alert "C2 indicator found in macOS DNS logs (${C2_DOMAIN} or ${C2_IP})"
     ARTIFACT_FOUND=true
   fi
+else
+  # Check common Linux log locations
+  for logfile in /var/log/syslog /var/log/messages /var/log/kern.log; do
+    if [[ -f "$logfile" ]]; then
+      if grep -qE "${C2_DOMAIN}|${C2_IP}" "$logfile" 2>/dev/null; then
+        log_alert "C2 indicator found in ${logfile}"
+        ARTIFACT_FOUND=true
+      fi
+    fi
+  done
+  # Check journald if available
+  if command -v journalctl &>/dev/null; then
+    if journalctl --since "48 hours ago" --no-pager -q 2>/dev/null \
+      | grep -qE "${C2_DOMAIN}|${C2_IP}" 2>/dev/null; then
+      log_alert "C2 indicator found in journald logs"
+      ARTIFACT_FOUND=true
+    fi
+  fi
+fi
+
+# 5d. Check for the RAT's fake User-Agent in proxy/access logs (if readable)
+for access_log in /var/log/squid/access.log /var/log/nginx/access.log /var/log/apache2/access.log /var/log/httpd/access_log; do
+  if [[ -f "$access_log" ]] && [[ -r "$access_log" ]]; then
+    if grep -qi "msie 8.0.*windows nt 5.1.*trident/4.0" "$access_log" 2>/dev/null; then
+      log_alert "RAT User-Agent signature found in ${access_log}"
+      ARTIFACT_FOUND=true
+    fi
+  fi
+done
+
+# --- 6. Check npm cache for malicious tarballs ---
+echo -e "${BOLD}[6/6] Scanning npm cache for compromised packages...${RESET}"
+
+NPM_CACHE_DIR=""
+if command -v npm &>/dev/null; then
+  NPM_CACHE_DIR=$(npm config get cache 2>/dev/null || true)
+fi
+[[ -z "$NPM_CACHE_DIR" ]] && NPM_CACHE_DIR="${HOME}/.npm"
+
+if [[ -d "$NPM_CACHE_DIR" ]]; then
+  # Check _cacache content for plain-crypto-js references
+  if grep -rq "${MALICIOUS_DEP}" "${NPM_CACHE_DIR}/_cacache/" 2>/dev/null; then
+    log_alert "Malicious package '${MALICIOUS_DEP}' found in npm cache: ${NPM_CACHE_DIR}"
+    log_warn "  Run 'npm cache clean --force' after investigation to remove cached malicious tarballs"
+    escalate_severity "INSTALLED"
+  fi
+  # Check for related campaign packages in cache
+  for related_pkg in "${RELATED_PKGS[@]}"; do
+    if grep -rq "${related_pkg}" "${NPM_CACHE_DIR}/_cacache/" 2>/dev/null; then
+      log_alert "Related campaign package '${related_pkg}' found in npm cache"
+      escalate_severity "INSTALLED"
+    fi
+  done
+else
+  log_warn "npm cache directory not found at ${NPM_CACHE_DIR} — skipping cache check"
 fi
 
 if [[ "$ARTIFACT_FOUND" == true ]]; then
@@ -350,11 +494,15 @@ case "$SEVERITY" in
     echo "  5. Alert your security team and the rest of the organization."
     echo "     → Other machines/environments may also be affected."
     echo ""
-    echo "  6. Clean the lockfile:"
+    echo "  6. Clean the npm cache:"
+    echo "     - Run: npm cache clean --force"
+    echo "     → Removes cached malicious tarballs that would re-infect on reinstall."
+    echo ""
+    echo "  7. Clean the lockfile:"
     echo "     - Pin axios to a safe version (1.14.0 / 0.30.3)"
     echo "     - Delete lockfile and node_modules/, reinstall, verify no plain-crypto-js"
     echo ""
-    echo "  7. Consider the machine compromised until proven otherwise."
+    echo "  8. Consider the machine compromised until proven otherwise."
     echo "     → Audit access logs for services this machine connected to."
     echo ""
     echo -e " ${BOLD}Best practice:${RESET} pin exact dependency versions in package.json to prevent"
@@ -395,7 +543,8 @@ case "$SEVERITY" in
     echo "  6. Evaluate a full machine wipe and rebuild."
     echo "     → The safest remediation for a confirmed RAT infection."
     echo ""
-    echo "  7. After rebuild: clean the lockfile:"
+    echo "  7. After rebuild: clean npm cache and lockfile:"
+    echo "     - Run: npm cache clean --force"
     echo "     - Pin axios to a safe version (1.14.0 / 0.30.3)"
     echo "     - Delete lockfile and node_modules/, reinstall, verify no plain-crypto-js"
     echo ""
