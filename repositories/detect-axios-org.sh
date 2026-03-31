@@ -6,7 +6,9 @@
 # Requires: gh CLI (authenticated)
 #
 # Scans package-lock.json, yarn.lock, pnpm-lock.yaml, bun.lock in every repo
-# of the given GitHub organization, looking for axios@1.14.1, axios@0.30.4, or plain-crypto-js.
+# of the given GitHub organization, looking for:
+#   - axios@1.14.1, axios@0.30.4, or plain-crypto-js
+#   - Related campaign packages (@shadanai/openclaw, @qqbrowser/openclaw-qbot)
 
 set -euo pipefail
 
@@ -20,6 +22,8 @@ RESET='\033[0m'
 COMPROMISED_VERSION="1.14.1"
 COMPROMISED_VERSION_0X="0.30.4"
 MALICIOUS_DEP="plain-crypto-js"
+# Related campaign packages (same attacker infrastructure)
+RELATED_PKGS=("@shadanai/openclaw" "@qqbrowser/openclaw-qbot")
 PARALLEL=10
 BRANCH_MODE="default"  # "default" = default branch only, "all" = all branches
 INCLUDE_ARCHIVED=false
@@ -86,6 +90,7 @@ echo "Organization: ${ORG}"
 echo "Parallelism:  ${PARALLEL}"
 echo "Branch mode:  ${BRANCH_MODE}"
 echo "Looking for:  axios@${COMPROMISED_VERSION} / axios@${COMPROMISED_VERSION_0X} / ${MALICIOUS_DEP}"
+echo "Also checking: ${RELATED_PKGS[*]}"
 echo ""
 
 # --- List all repos ---
@@ -155,6 +160,9 @@ scan_repo() {
   local repo="$1"
   local repo_short="${repo#*/}"
   local branches=()
+  # Reconstruct array from exported string (bash can't export arrays)
+  local RELATED_PKGS=()
+  IFS=' ' read -ra RELATED_PKGS <<< "$RELATED_PKGS_STR"
 
   if [[ "$BRANCH_MODE" == "all" ]]; then
     while IFS= read -r b; do
@@ -246,6 +254,15 @@ scan_repo() {
         found_dep=true
       fi
 
+      # Related campaign packages
+      local found_related=false
+      for related_pkg in "${RELATED_PKGS[@]}"; do
+        if grep -q "${related_pkg}" "$tmpfile" 2>/dev/null; then
+          found_related=true
+          break
+        fi
+      done
+
       # Use per-worker result file to avoid parallel write interleaving
       local worker_results="${SCAN_TMPDIR}/results_${BASHPID}.log"
 
@@ -258,6 +275,13 @@ scan_repo() {
 
       if [[ "$found_dep" == true ]]; then
         local msg="${RED}[ALERT]${RESET} ${MALICIOUS_DEP} in ${BOLD}${repo}${RESET} @ ${branch} — ${lockfile_path}"
+        echo -e "$msg" >> "$worker_results"
+        echo -e "$msg"
+        file_status="COMPROMISED"
+      fi
+
+      if [[ "$found_related" == true ]]; then
+        local msg="${RED}[ALERT]${RESET} Related campaign package in ${BOLD}${repo}${RESET} @ ${branch} — ${lockfile_path}"
         echo -e "$msg" >> "$worker_results"
         echo -e "$msg"
         file_status="COMPROMISED"
@@ -296,6 +320,7 @@ scan_repo() {
 export -f scan_repo gh_api_retry
 export RED YELLOW GREEN BOLD DIM RESET
 export COMPROMISED_VERSION COMPROMISED_VERSION_0X MALICIOUS_DEP BRANCH_MODE REPO_COUNT
+export RELATED_PKGS_STR="${RELATED_PKGS[*]}"
 export SCAN_TMPDIR RESULTS_FILE PROGRESS_FILE
 # --- Run in parallel ---
 echo -e "${BOLD}Scanning repositories (${PARALLEL} parallel workers)...${RESET}"
