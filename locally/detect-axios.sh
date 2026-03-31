@@ -41,6 +41,18 @@ ROOT="${1:-/}"
 FOUND=0
 SEVERITY="CLEAN"  # CLEAN → LATENT → INSTALLED → CONFIRMED
 
+# Prune expression for find: skip virtual/network filesystems and system dirs
+# that cannot contain node_modules or JS lockfiles.
+FIND_PRUNE=(
+  \( -fstype proc -o -fstype sysfs -o -fstype devtmpfs -o -fstype devpts
+     -o -fstype tmpfs -o -fstype cgroup -o -fstype cgroup2
+     -o -fstype fuse -o -fstype fuse.gvfsd-fuse
+     -o -fstype nfs -o -fstype nfs4 -o -fstype cifs
+     -o -path /etc -o -path /boot -o -path /lost+found
+     -o -path /bin -o -path /sbin -o -path /usr/bin -o -path /usr/sbin
+  \) -prune
+)
+
 escalate_severity() {
   local new="$1"
   case "$SEVERITY" in
@@ -87,10 +99,7 @@ while IFS= read -r pkg_json; do
     escalate_severity "LATENT"
   fi
 done < <(find "$ROOT" \
-  \( -fstype proc -o -fstype sysfs -o -fstype devtmpfs -o -fstype devpts \
-     -o -fstype tmpfs -o -fstype cgroup -o -fstype cgroup2 \
-     -o -fstype fuse -o -fstype fuse.gvfsd-fuse \
-     -o -fstype nfs -o -fstype nfs4 -o -fstype cifs \) -prune \
+  "${FIND_PRUNE[@]}" \
   -o -path '*/node_modules/axios/package.json' \
      -not -path '*/node_modules/*/node_modules/axios/package.json' \
      -print \
@@ -204,10 +213,7 @@ sys.exit(rc)
 while IFS= read -r lockfile; do
   scan_lockfile "$lockfile" || true
 done < <(find "$ROOT" \
-  \( -fstype proc -o -fstype sysfs -o -fstype devtmpfs -o -fstype devpts \
-     -o -fstype tmpfs -o -fstype cgroup -o -fstype cgroup2 \
-     -o -fstype fuse -o -fstype fuse.gvfsd-fuse \
-     -o -fstype nfs -o -fstype nfs4 -o -fstype cifs \) -prune \
+  "${FIND_PRUNE[@]}" \
   -o \( -name 'package-lock.json' \
         -o -name 'yarn.lock' \
         -o -name 'pnpm-lock.yaml' \
@@ -224,10 +230,7 @@ while IFS= read -r mal_pkg; do
   log_alert "Malicious package installed: ${mal_pkg}"
   escalate_severity "INSTALLED"
 done < <(find "$ROOT" \
-  \( -fstype proc -o -fstype sysfs -o -fstype devtmpfs -o -fstype devpts \
-     -o -fstype tmpfs -o -fstype cgroup -o -fstype cgroup2 \
-     -o -fstype fuse -o -fstype fuse.gvfsd-fuse \
-     -o -fstype nfs -o -fstype nfs4 -o -fstype cifs \) -prune \
+  "${FIND_PRUNE[@]}" \
   -o -path "*node_modules/${MALICIOUS_DEP}/package.json" -print \
   2>/dev/null || true)
 
@@ -237,7 +240,8 @@ for related_pkg in "${RELATED_PKGS[@]}"; do
     log_alert "Related campaign package installed: ${rel_pkg}"
     escalate_severity "INSTALLED"
   done < <(find "$ROOT" \
-    -path "*node_modules/${related_pkg}/package.json" \
+    "${FIND_PRUNE[@]}" \
+    -o -path "*node_modules/${related_pkg}/package.json" -print \
     2>/dev/null || true)
 done
 
