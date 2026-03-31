@@ -241,9 +241,9 @@ scan_repo() {
           fi
           ;;
         bun.lockb)
-          # Binary format: strings stored separately, check both present
-          if grep -qa "axios" "$tmpfile" 2>/dev/null && \
-             grep -qaE "(${COMPROMISED_VERSION}|${COMPROMISED_VERSION_0X})" "$tmpfile" 2>/dev/null; then
+          # bun.lockb is binary — match the npm tarball URL to tie package name to version
+          # avoids false positives from unrelated packages (e.g. tslib@1.14.1)
+          if strings "$tmpfile" 2>/dev/null | grep -qE "axios/-/axios-(${COMPROMISED_VERSION}|${COMPROMISED_VERSION_0X})\.tgz"; then
             found_axios=true
           fi
           ;;
